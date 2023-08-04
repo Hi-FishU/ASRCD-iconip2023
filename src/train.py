@@ -2,6 +2,7 @@ import time
 
 import numpy as np
 import pandas as pd
+from sklearn import metrics
 import torch
 from torch._C import import_ir_module
 import torch.nn as nn
@@ -9,11 +10,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tqdm
 from sklearn.metrics import mean_squared_error, roc_auc_score
+from torch.utils.tensorboard import SummaryWriter
 
 from dataload import dataset_load
-from models import GCD_Res_MLP as Res_MLP
+from models import GCD_Res_MLP, ASRCD
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cpu')
 
 
 def evaluation(
@@ -49,7 +52,7 @@ def evaluation(
     for index, data in enumerate(data_loader):
         # Categogrical encoding
         skill, stu_id, exer_id, labels = data
-        output = model_eval(stu_id, exer_id, skill, difficulty)
+        output = model_eval(stu_id, exer_id, skill)
 
         pred = torch.as_tensor(output.squeeze()) > 0.5
         all_labels.extend(labels.numpy().tolist())
@@ -69,6 +72,7 @@ def evaluation(
 def train_weight(student_n,
                  skill_k,
                  exer_e,
+                 embed_dim=50,
                  hidden_dim_1=512,
                  hidden_dim_2=256,
                  dropout=0.3,
@@ -80,8 +84,8 @@ def train_weight(student_n,
                  is_deep=True,
                  graph='Chi',
                  batch_size=32,
-                 train_ratio=0.6,
-                 val_ratio=0.3,
+                 train_ratio=0.7,
+                 val_ratio=0.2,
                  eps=1e-8,
                  sche_milestones=[],
                  L2_lamb=0.0,
@@ -126,9 +130,16 @@ def train_weight(student_n,
     record_time = str(
         time.strftime("%Y%m%d %H%M%S", time.localtime(time.time())))
 
-    model = Res_MLP(student_n=student_n,
+    with open(r'/home/fishu/IGCD/temp/chi.npy', mode='rb') as f:
+        cov = np.load(f)
+
+    cov = torch.Tensor(cov) - torch.eye(cov.shape[0])
+
+    model = ASRCD(student_n=student_n,
                     skill_k=skill_k,
                     exer_e=exer_e,
+                    embed_dim=embed_dim,
+                    cov=cov,
                     hidden_dim_1=hidden_dim_1,
                     hidden_dim_2=hidden_dim_2,
                     dropout=dropout,
@@ -146,13 +157,14 @@ def train_weight(student_n,
     # scheduler = optim.lr_scheduler.StepLR(optimizer,
     #                                       step_size=lr_decay,
     #                                       gamma=gamma)
-    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
-    #                                                  mode='min',
-    #                                                  patience=30,
-    #                                                  factor=0.5)
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
-                                               milestones=sche_milestones,
-                                               gamma=gamma)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
+                                                     mode='min',
+                                                     patience=30,
+                                                     factor=0.5,
+                                                     threshold=0.01)
+    # scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
+    #                                            milestones=sche_milestones,
+    #                                            gamma=gamma)
 
     with open(r'temp/skill_correct.npy', mode='rb') as f:
         difficulty = 1 - np.load(f)[:, 2]
@@ -162,6 +174,7 @@ def train_weight(student_n,
             'Config:\n\tgraph:{}\tbatch size:{}\tlr:{}\tl2:{}\teps:{}\tepoch:{}\tRes:{}\tDeep:{}\n\nTrain_Record:\n'
             .format(graph, batch_size, lr, L2_lamb, eps, epochs, res_mode,
                     is_deep))
+    writer = SummaryWriter("out/tensorboard")
 
     for epoch in range(epochs):
         correct, total = 0, 0
@@ -169,12 +182,13 @@ def train_weight(student_n,
         print('Current lr:{}'.format(
             optimizer.state_dict()['param_groups'][0]['lr']))
 
-        for data in tqdm.tqdm(train_data_loader):
+        for index, data in enumerate(train_data_loader):
+        # for data in tqdm.tqdm(train_data_loader):
             model.train()
             skill, stu_id, exer_id, labels = data
             optimizer.zero_grad()
 
-            output = model(stu_id, exer_id, skill, difficulty)
+            output = model(stu_id, exer_id, skill)
             labels = labels.to(device)
             labels_mask = nn.functional.one_hot(labels, num_classes=2)
             output1 = torch.ones(output.size()).to(device) - output
@@ -184,13 +198,14 @@ def train_weight(student_n,
             loss = criterion(torch.log(outputs), labels)
             #BCELoss
             #loss = criterion(outputs.float(), labels_mask.float())
-
-            epoch_loss.append(loss.cpu().detach().numpy())
             loss.backward()
             optimizer.step()
+            single_loss = loss.cpu().detach().numpy()
+            writer.add_scalar('EPOCH LOSS', single_loss, global_step=len(epoch_loss))
+            epoch_loss.append(single_loss)
             model.apply_clipper()
 
-        epoch_acc, epoch_auc, _ = evaluation(student_n=student_n,
+        epoch_acc, epoch_auc, epoch_rmse = evaluation(student_n=student_n,
                                              skill_k=skill_k,
                                              exer_e=exer_e,
                                              model=model,
@@ -201,7 +216,7 @@ def train_weight(student_n,
                                              is_deep=is_deep,
                                              graph=graph,
                                              difficulty=difficulty)
-        acc_valid, auc_valid, rmse_valid = evaluation(
+        valid_acc, valid_auc, valid_rmse = evaluation(
             student_n=student_n,
             skill_k=skill_k,
             exer_e=exer_e,
@@ -217,7 +232,11 @@ def train_weight(student_n,
         print('Train loss for epoch {}: {}, accuracy: {}, AUC:{}'.format(
             epoch + 1, np.mean(epoch_loss), epoch_acc, epoch_auc))
         print('Valid RMSE for epoch {}: {}, accuracy: {}, AUC:{}'.format(
-            epoch + 1, rmse_valid, acc_valid, auc_valid))
+            epoch + 1, valid_rmse, valid_acc, valid_auc))
+        writer.add_scalars('RMSE', {'Train':epoch_rmse, 'Valid': valid_rmse}, epoch)
+        writer.add_scalars('ACC', {'Train':epoch_acc, 'Valid': valid_acc}, epoch)
+        writer.add_scalars('AUC', {'Train':epoch_auc, 'Valid': valid_auc}, epoch)
+
 
         with open(r'model/log/Record_{}.txt'.format(record_time),
                   mode='a') as f:
@@ -228,9 +247,10 @@ def train_weight(student_n,
                     epoch + 1, np.mean(epoch_loss), epoch_acc, epoch_auc))
             f.write(
                 'Valid RMSE for epoch {}: {}, accuracy: {}, AUC:{}\n'.format(
-                    epoch + 1, rmse_valid, acc_valid, auc_valid))
+                    epoch + 1, valid_rmse, valid_acc, valid_auc))
 
-        scheduler.step()
+        # scheduler.step()
+        scheduler.step(metrics=epoch_auc)
     # Eval
     model.eval()
 
@@ -238,7 +258,7 @@ def train_weight(student_n,
     all_preds = []
     all_labels = []
 
-    acc_train, auc_train, rmse_train = evaluation(
+    acc_train, auc_train, epoch_rmse = evaluation(
         student_n=student_n,
         skill_k=skill_k,
         exer_e=exer_e,
@@ -256,7 +276,7 @@ def train_weight(student_n,
     for index, data in enumerate(test_data_loader):
         # Categogrical encoding
         skill, stu_id, exer_id, label = data
-        output = model(stu_id, exer_id, skill, difficulty)
+        output = model(stu_id, exer_id, skill)
 
         pred = torch.as_tensor(output.squeeze()) > 0.5
         all_labels.extend(labels.cpu().detach().numpy().tolist())
@@ -265,18 +285,18 @@ def train_weight(student_n,
         labels = labels.to(device)
         correct += torch.eq(pred, labels).sum()
         total += len(labels)
-        stu_knowledge_status.update(
-            dict(
-                zip(
-                    stu_id.cpu().numpy().tolist(),
-                    model.get_knowledge_status(
-                        stu_id.to(device)).cpu().numpy().tolist())))
-        interaction_emb.extend(
-            np.concatenate([
-                model.get_interaction(stu_id, exer_id, skill,
-                                      difficulty).cpu().detach().numpy(),
-                label.unsqueeze(0).numpy().T
-            ], 1).tolist())
+        # stu_knowledge_status.update(
+        #     dict(
+        #         zip(
+        #             stu_id.cpu().numpy().tolist(),
+        #             model.get_knowledge_status(
+        #                 stu_id.to(device)).cpu().numpy().tolist())))
+        # interaction_emb.extend(
+        #     np.concatenate([
+        #         model.get_interaction(stu_id, exer_id, skill,
+        #                               difficulty).cpu().detach().numpy(),
+        #         label.unsqueeze(0).numpy().T
+        #     ], 1).tolist())
 
     auc = roc_auc_score(all_labels, all_preds)
     rmse = mean_squared_error(all_labels, all_preds)**0.5
@@ -286,7 +306,7 @@ def train_weight(student_n,
             'TRAIN:\n-------------------------------------------------------------\n'
         )
         f.write('|\tAccuracy: {:.8f}, AUC: {:.8f}, RMSE: {:.8f}\t|\n'.format(
-            acc_train, auc_train, rmse_train))
+            acc_train, auc_train, epoch_rmse))
         f.write(
             '-------------------------------------------------------------\n')
         f.write(
@@ -300,7 +320,7 @@ def train_weight(student_n,
         'TRAIN:\n-----------------------------------------------------------------\n|\t',
         end='')
     print('Accuracy: {:.8f}, AUC: {:.8f}, RMSE: {:.8f}\t|'.format(
-        acc_train, auc_train, rmse_train))
+        acc_train, auc_train, epoch_rmse))
     print('-----------------------------------------------------------------')
     print(
         'TEST:\n-----------------------------------------------------------------\n|\t',
@@ -310,13 +330,7 @@ def train_weight(student_n,
     print('-----------------------------------------------------------------')
     torch.save(model.state_dict(),
                'model/Res_MLP_ep{}_{:.3f}.pt'.format(epochs, auc))
-    print('Extracting students knowledge status...')
-    pd.DataFrame.from_dict(
-        stu_knowledge_status, orient='index',
-        columns=skill_id).to_csv('student_knowledge_status.csv')
-    print('Extracting interaction embedding...')
-    pd.DataFrame(interaction_emb).to_csv('interaction.csv')
-    return acc, auc, rmse, acc_train, auc_train, rmse_train
+    return acc, auc, rmse, acc_train, auc_train, epoch_rmse
 
 
 if __name__ == '__main__':
@@ -332,18 +346,19 @@ if __name__ == '__main__':
     train_weight(student_n=max(stu_id),
                  skill_k=len(skill_id),
                  exer_e=max(exer_id),
-                 hidden_dim_1=512,
-                 hidden_dim_2=256,
-                 dropout=0.3,
-                 epochs=5,
+                 embed_dim=15,
+                 hidden_dim_1=64,
+                 hidden_dim_2=32,
+                 dropout=0.8,
+                 epochs=300,
                  lr=0.001,
-                 eps=3e-8,
+                 eps=1e-4,
                  L2_lamb=1e-4,
-                 lr_decay=8,
+                 lr_decay=10,
                  graph='Chi_MHA',
-                 res_mode=True,
-                 is_deep=True,
+                 res_mode=False,
+                 is_deep=False,
                  sche_milestones=[5, 8],
-                 batch_size=256,
+                 batch_size=512,
                  device=device)
     print('done')
