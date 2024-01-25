@@ -19,9 +19,13 @@ The things you need before deploy the model.
 
 ## Usage
 
-A few examples of useful commands and/or tasks.
+You could freely adjuest the hyperparameters from the files shown in follows to fit your requirement.
 
+* Manual train and test
 ```
-$ Manual train and test run  src/train.py
-$ Tuning by RayTune, run src/tune_for_revised.py
+$ src/train.py 
+```
+* Tuning by RayTune
+```
+$ src/tune_for_revised.py
 ```
