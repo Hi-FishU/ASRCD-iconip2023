@@ -19,7 +19,7 @@ The things you need before deploy the model.
 
 ## Usage
 
-You could freely adjuest the hyperparameters from the files shown in follows to fit your requirement.
+You could freely adjust the hyperparameters from the files shown in follows to fit your requirement.
 
 * Manual train and test
 ```
@@ -29,3 +29,7 @@ $ src/train.py
 ```
 $ src/tune_for_revised.py
 ```
+
+## Dataset
+
+The SPOC deidentifical dataset is published on Kaggle (**[link](https://www.kaggle.com/datasets/zhuonanliang/ms-namc)**).
